@@ -1,0 +1,5 @@
+fastmcp
+aiohttp
+pydantic
+pydantic-settings
+aiosqlite
