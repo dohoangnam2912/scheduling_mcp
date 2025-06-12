@@ -18,7 +18,7 @@ from fastmcp.exceptions import ToolError
 class AppSettings(BaseSettings):
     """Manages application settings via environment variables or a .env file."""
     model_config = SettingsConfigDict(env_prefix='APP_')
-    api_base_url: str = "http://localhost:8000"
+    api_base_url: str = "https://main-sf6r.onrender.com"
     request_timeout: int = 15
 
 settings = AppSettings()
