@@ -3,7 +3,7 @@
     "transport": "streamable_http",
     "url": "https://scheduling-mcp.onrender.com/mcp",
     "headers": {
-      "Authorization": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2Zhc3RtY3AuZXhhbXBsZS5jb20iLCJzdWIiOiJkZXYtdXNlciIsImlhdCI6MTc0OTc5OTY4NCwiZXhwIjoxNzQ5ODAzMjg0LCJzY29wZSI6ImFwaTphY2Nlc3Mgc2NoZWR1bGU6cmVhZCBzY2hlZHVsZTp3cml0ZSJ9.rJGA5kVAEy1O1QgXFPrNo5_VLtFALq1eF9oHnldER-cuQctaZeScSsgzTo3YkY9GagRN5XGMUD28g04--NnVTnvFzbmRk1SBFM7ObR4zkq1NmlU3SfrsMwUIZpQFNe6EzH6XOTJXgDWwKZIQVUJUJh2TIb4aMhnjYX8_0cXVP3GNeT1-HKpiTqqXI4ea1M73-pZ_ijjRfQzQP59_BzWSeKwU4iQiNBqskdQXQd9SedyheD27ypmC8yAQUy9C2qmUEVTUAmDj9IHcftxJ2wroqqTY9-UECxPiyK7ViOqRswcgPHwFRx332FhbbNFX88FEIIPj6EA2ECm2sgqtc8KvIw"
+      "Authorization": "Bearer"
     },
     "timeout": 50
   }
