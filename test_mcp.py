@@ -8,11 +8,15 @@ import uuid
 import os
 
 import aiohttp
-from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
+from pydantic import BaseModel, Field, model_validator, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fastmcp import FastMCP, Context
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth import BearerAuthProvider
+from fastmcp.server.auth.providers.bearer import RSAKeyPair
+from fastmcp.server.dependencies import get_access_token, AccessToken
+
 
 # --- 1. Centralized Configuration ---
 class AppSettings(BaseSettings):
@@ -27,37 +31,60 @@ settings = AppSettings()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - [%(levelname)s] - %(message)s")
 logger = logging.getLogger("business-scheduler-mcp")
 
-# --- 3. Error Handling Decorator (No longer needed for API errors) ---
-# The logic is now handled inside each tool for better error detail.
+# --- 3. Improved Error Handling Decorator ---
 def handle_tool_errors(func):
-    """A decorator to standardize non-API error handling."""
+    """A decorator to standardize error handling and provide detailed validation feedback."""
     @wraps(func)
     async def wrapper(*args, **kwargs):
         try:
+            ctx = kwargs.get('ctx')
+            if ctx:
+                await ctx.debug(f"Executing tool: {func.__name__}")
             return await func(*args, **kwargs)
         except ValidationError as e:
-            error_msg = f"Invalid input: {e}"
+            first_error = e.errors()[0]
+            field = " -> ".join(map(str, first_error['loc']))
+            msg = first_error['msg']
+            error_msg = f"Invalid input for field '{field}': {msg}"
             logger.error(f"Validation error in {func.__name__}: {error_msg}")
+            if ctx:
+                await ctx.error(f"Validation failed: {error_msg}")
             raise ToolError(error_msg)
+        except ToolError:
+            raise
         except Exception as e:
             error_msg = f"An unexpected error occurred in {func.__name__}: {str(e)}"
             logger.error(error_msg, exc_info=True)
+            if ctx:
+                await ctx.error(f"Unexpected server error: {error_msg}")
             raise ToolError(error_msg)
     return wrapper
 
-# --- 4. FastMCP Setup ---
+# --- 4. FastMCP Setup with Scope-Based Authentication ---
+key_pair = RSAKeyPair.generate()
+
+# REASON FOR IMPROVEMENT:
+# We're now adding `required_scopes`. This enforces that any token used to
+# communicate with this server MUST have the 'api:access' scope. This acts
+# as a baseline authorization check for the entire server.
+auth_provider = BearerAuthProvider(
+    public_key=key_pair.public_key,
+    required_scopes=["api:access"]
+)
+
 mcp = FastMCP(
     name="business-scheduling-assistant",
     instructions="""
     This is an intelligent assistant for managing business schedules.
     It can create, update, delete, and query schedules for private lessons, group classes, or block-off time.
-    All operations require a valid JSON Web Token (JWT) for authentication.
+    All operations require a valid JSON Web Token (JWT) with appropriate scopes for authentication.
     """,
-    mask_error_details=False,
+    auth=auth_provider,
+    mask_error_details=True,
     on_duplicate_tools="error"
 )
 
-# --- 5. Pydantic Models with Business Logic ---
+# --- 5. Pydantic Models for Inputs and Outputs ---
 class ScheduleType(str, Enum):
     PRIVATE_LESSON = "PRIVATE_LESSON"
     GROUP_CLASS = "GROUP_CLASS"
@@ -73,30 +100,30 @@ class RecurringMode(str, Enum):
     THIS_AND_FUTURE = "THIS_AND_FUTURE"
     ENTIRE_SERIES = "ENTIRE_SERIES"
 
-class CreateScheduleData(BaseModel):
-    title: str = Field(..., description="Title or name of the schedule entry.")
+class RecurringUpdateData(BaseModel):
+    mode: RecurringMode
+    instanceOriginalStartTime: datetime
+
+class _CreateScheduleInternal(BaseModel):
+    title: str
     startTime: datetime
     endTime: datetime
-    scheduleType: ScheduleType = Field(..., 
-        description="The type of schedule. Ask the user if it's for a 'private lesson', a 'group class', or to 'block off' time. Use the corresponding technical value: PRIVATE_LESSON, GROUP_CLASS, or BLOCK_OFF."
-    )
-    scheduleLocationType: ScheduleLocationType = Field(...,
-        description="The location type for the schedule. Ask the user if it will be 'virtual', 'in-person' at the studio, or at a 'custom address'. Use the corresponding technical value: VIRTUAL, IN_PERSON, or CUSTOM_ADDRESS."
-    )
-    organizationId: str = Field(..., description="The user's organization ID.")
-    locationId: str = Field(..., description="The user's selected location ID.")
-    studentId: Optional[str] = Field(None, description="Required if scheduleType is PRIVATE_LESSON.")
-    groupClassId: Optional[str] = Field(None, description="Required if scheduleType is GROUP_CLASS.")
-    meetingUrl: Optional[str] = Field(None, description="Required if scheduleLocationType is VIRTUAL.")
-    roomId: Optional[str] = Field(None, description="Required if scheduleLocationType is IN_PERSON.")
-    customAddress: Optional[str] = Field(None, description="Required if scheduleLocationType is CUSTOM_ADDRESS.")
+    scheduleType: ScheduleType
+    scheduleLocationType: ScheduleLocationType
+    organizationId: str
+    locationId: str
+    studentId: Optional[str] = None
+    groupClassId: Optional[str] = None
+    meetingUrl: Optional[str] = None
+    roomId: Optional[str] = None
+    customAddress: Optional[str] = None
     description: Optional[str] = None
     instructorId: Optional[str] = None
     isRecurring: bool = False
-    recurrenceRule: Optional[str] = Field(None, description="iCalendar RRULE string (e.g., 'FREQ=WEEKLY;BYDAY=MO').")
-    
+    recurrenceRule: Optional[str] = None
+
     @model_validator(mode='after')
-    def check_conditional_fields(self) -> 'CreateScheduleData':
+    def check_conditional_fields(self) -> '_CreateScheduleInternal':
         if self.scheduleType == ScheduleType.PRIVATE_LESSON and not self.studentId:
             raise ValueError("`studentId` is required for a PRIVATE_LESSON.")
         if self.scheduleType == ScheduleType.GROUP_CLASS and not self.groupClassId:
@@ -109,90 +136,157 @@ class CreateScheduleData(BaseModel):
             raise ValueError("`customAddress` is required for a CUSTOM_ADDRESS location.")
         return self
 
-class UpdateScheduleBody(BaseModel):
-    """Body for the update request. Only handles time updates."""
-    startTime: datetime = Field(..., description="The new start time.")
-    endTime: datetime = Field(..., description="The new end time.")
-    
-    mode: Optional[RecurringMode] = Field(None, description="Required if updating a recurring event.")
-    instanceOriginalStartTime: Optional[datetime] = Field(None, description="For recurring events, the original start time of the instance being edited.")
-
-class DeleteScheduleBody(BaseModel):
+class ScheduleRecord(BaseModel):
     scheduleRecordId: str
-    mode: Optional[RecurringMode] = Field(None, description="Required if deleting a recurring event.")
-    instanceOriginalStartTime: Optional[datetime] = Field(None, description="For recurring events, the original start time of the instance being deleted.")
+    title: str
+    startTime: datetime
+    endTime: datetime
 
-class QueryScheduleParams(BaseModel):
-    startDate: date
-    endDate: date
-    organizationId: str
-    locationId: str
+class ScheduleListResponse(BaseModel):
+    data: List[ScheduleRecord]
 
-# --- 6. Corrected Tools with Improved Error Handling ---
-@mcp.tool(description="Creates a new schedule entry (e.g., lesson, class, or block-off).")
+class GenericSuccessResponse(BaseModel):
+    success: bool
+    message: str
+    scheduleRecordId: Optional[str] = None
+
+# --- 6. Tools with Granular Scope-Based Authorization ---
+def require_scope(required_scope: str):
+    """Helper function to check for a specific scope in the access token."""
+    access_token: AccessToken = get_access_token()
+    if required_scope not in access_token.scopes:
+        raise ToolError(f"Permission denied: Requires scope '{required_scope}'.")
+
+@mcp.tool(
+    description="Creates a new schedule entry (e.g., lesson, class, or block-off time).",
+    tags={"write", "schedule"},
+    annotations={"readOnlyHint": False}
+)
 @handle_tool_errors
-async def create_schedule(jwt: Annotated[str, Field(description="User's JWT for authentication.")], data: CreateScheduleData, ctx: Context) -> dict:
-    logger.info(f"Attempting to create schedule: {data.title}")
-    headers = {"Authorization": f"Bearer {jwt}"}
-    payload = data.model_dump(mode='json', exclude_none=True)
-
+async def create_schedule(
+    # Arguments remain the same...
+    title: Annotated[str, Field(description="Title or name of the schedule entry.", min_length=2)],
+    startTime: Annotated[datetime, Field(description="The start time for the event.")],
+    endTime: Annotated[datetime, Field(description="The end time for the event.")],
+    scheduleType: Annotated[ScheduleType, Field(description="The type of schedule.")],
+    scheduleLocationType: Annotated[ScheduleLocationType, Field(description="The location type.")],
+    organizationId: Annotated[str, Field(description="The user's organization ID.")],
+    locationId: Annotated[str, Field(description="The user's selected location ID.")],
+    studentId: Optional[str] = None, groupClassId: Optional[str] = None, meetingUrl: Optional[str] = None,
+    roomId: Optional[str] = None, customAddress: Optional[str] = None, description: Optional[str] = None,
+    instructorId: Optional[str] = None, isRecurring: bool = False, recurrenceRule: Optional[str] = None,
+    ctx: Context = None
+) -> GenericSuccessResponse:
+    # REASON FOR IMPROVEMENT:
+    # We now explicitly check for the 'schedule:write' scope before proceeding.
+    # This ensures only clients with write permissions can create schedules.
+    require_scope("schedule:write")
+    
+    await ctx.info(f"Permissions verified. Creating schedule '{title}'...")
+    
+    headers = {"Authorization": f"Bearer {get_access_token().token}"}
+    schedule_data = _CreateScheduleInternal(**locals())
+    payload = schedule_data.model_dump(mode='json', exclude_none=True)
+    
+    await ctx.info("Sending request to create schedule in backend...")
     async with aiohttp.ClientSession(base_url=settings.api_base_url, timeout=aiohttp.ClientTimeout(total=settings.request_timeout)) as session:
         async with session.post("/api/v1/account/schedule", headers=headers, json=payload) as response:
             if not response.ok:
                 error_detail = await response.text()
+                await ctx.error(f"Backend API failed with status {response.status}.")
                 raise ToolError(f"API Error ({response.status}): {error_detail}")
             result = await response.json()
     
-    logger.info(f"Successfully created schedule '{data.title}', ID: {result.get('scheduleRecordId')}")
-    return result
+    schedule_id = result.get('scheduleRecordId')
+    logger.info(f"Successfully created schedule '{title}', ID: {schedule_id}")
+    await ctx.info("Successfully created schedule.")
+    return GenericSuccessResponse(
+        success=True, message=f"Successfully created schedule '{title}'.", scheduleRecordId=schedule_id
+    )
 
-@mcp.tool(description="Deletes a schedule entry.")
+@mcp.tool(
+    description="Deletes a schedule entry. Can delete a single instance or an entire series.",
+    tags={"write", "schedule"},
+    annotations={"readOnlyHint": False, "destructiveHint": True}
+)
 @handle_tool_errors
-async def delete_schedule(jwt: Annotated[str, Field(description="User's JWT for authentication.")], data: DeleteScheduleBody, ctx: Context) -> dict:
-    logger.info(f"Attempting to delete schedule ID: {data.scheduleRecordId}")
-    headers = {"Authorization": f"Bearer {jwt}"}
+async def delete_schedule(
+    scheduleRecordId: Annotated[str, Field(description="The unique ID of the schedule entry to delete.")],
+    recurring_data: Annotated[Optional[RecurringUpdateData], Field(description="Required ONLY if deleting an instance of a recurring event.")] = None,
+    ctx: Context = None
+) -> GenericSuccessResponse:
+    require_scope("schedule:write")
+    await ctx.info(f"Permissions verified. Deleting schedule ID: {scheduleRecordId}...")
     
+    headers = {"Authorization": f"Bearer {get_access_token().token}"}
+    payload = {"scheduleRecordId": scheduleRecordId}
+    if recurring_data:
+        payload.update(recurring_data.model_dump())
+
     async with aiohttp.ClientSession(base_url=settings.api_base_url, timeout=aiohttp.ClientTimeout(total=settings.request_timeout)) as session:
-        async with session.delete("/api/v1/account/schedule", headers=headers, json=data.model_dump(mode='json', exclude_none=True)) as response:
+        async with session.delete("/api/v1/account/schedule", headers=headers, json=payload) as response:
             if not response.ok:
                 error_detail = await response.text()
                 raise ToolError(f"API Error ({response.status}): {error_detail}")
-            result = await response.json()
-        
-    logger.info(f"Successfully deleted schedule ID: {data.scheduleRecordId}")
-    return result
+    
+    await ctx.info(f"Successfully deleted schedule ID: {scheduleRecordId}.")
+    return GenericSuccessResponse(
+        success=True, message=f"Successfully deleted schedule ID {scheduleRecordId}.", scheduleRecordId=scheduleRecordId
+    )
 
-@mcp.tool(description="Updates the start and end time of an existing schedule entry.")
+@mcp.tool(
+    description="Updates the start and end time of an existing schedule entry.",
+    tags={"write", "schedule"},
+    annotations={"readOnlyHint": False}
+)
 @handle_tool_errors
 async def update_schedule(
-    jwt: Annotated[str, Field(description="User's JWT for authentication.")],
     scheduleRecordId: Annotated[str, Field(description="ID of the schedule to update.")],
-    data: UpdateScheduleBody,
-    ctx: Context
-) -> dict:
-    logger.info(f"Attempting to update schedule ID: {scheduleRecordId}")
-    headers = {"Authorization": f"Bearer {jwt}"}
+    newStartTime: Annotated[datetime, Field(description="The new start time for the event.")],
+    newEndTime: Annotated[datetime, Field(description="The new end time for the event.")],
+    recurring_data: Annotated[Optional[RecurringUpdateData], Field(description="Required ONLY if updating an instance of a recurring event.")] = None,
+    ctx: Context = None
+) -> GenericSuccessResponse:
+    require_scope("schedule:write")
+    await ctx.info(f"Permissions verified. Updating schedule ID: {scheduleRecordId}...")
+    
+    headers = {"Authorization": f"Bearer {get_access_token().token}"}
+    payload = {"startTime": newStartTime.isoformat(), "endTime": newEndTime.isoformat()}
+    if recurring_data:
+        payload.update(recurring_data.model_dump())
 
     async with aiohttp.ClientSession(base_url=settings.api_base_url, timeout=aiohttp.ClientTimeout(total=settings.request_timeout)) as session:
-        async with session.put(f"/api/v1/account/schedule/{scheduleRecordId}", headers=headers, json=data.model_dump(mode='json', exclude_none=True)) as response:
+        async with session.put(f"/api/v1/account/schedule/{scheduleRecordId}", headers=headers, json=payload) as response:
             if not response.ok:
                 error_detail = await response.text()
                 raise ToolError(f"API Error ({response.status}): {error_detail}")
-            result = await response.json()
         
-    logger.info(f"Successfully updated schedule ID: {scheduleRecordId}")
-    return result
+    await ctx.info(f"Successfully updated schedule ID: {scheduleRecordId}.")
+    return GenericSuccessResponse(
+        success=True, message=f"Successfully updated schedule ID {scheduleRecordId}.", scheduleRecordId=scheduleRecordId
+    )
 
-@mcp.tool(description="Queries for schedules within a given date range.")
+@mcp.tool(
+    description="Queries for schedules within a given date range.",
+    tags={"read", "schedule"},
+    annotations={"readOnlyHint": True}
+)
 @handle_tool_errors
-async def query_schedules(jwt: Annotated[str, Field(description="User's JWT for authentication.")], params: QueryScheduleParams, ctx: Context) -> dict:
-    logger.info(f"Querying schedules from {params.startDate} to {params.endDate}")
-    headers = {"Authorization": f"Bearer {jwt}"}
+async def query_schedules(
+    startDate: Annotated[date, Field(description="The start date for the query range.")],
+    endDate: Annotated[date, Field(description="The end date for the query range.")],
+    organizationId: Annotated[str, Field(description="The user's organization ID.")],
+    locationId: Annotated[str, Field(description="The user's selected location ID.")],
+    ctx: Context = None
+) -> ScheduleListResponse:
+    # This tool requires the 'schedule:read' scope.
+    require_scope("schedule:read")
+    await ctx.info(f"Permissions verified. Querying schedules from {startDate} to {endDate}...")
+    
+    headers = {"Authorization": f"Bearer {get_access_token().token}"}
     query_params = {
-        "startDate": params.startDate.isoformat(),
-        "endDate": params.endDate.isoformat(),
-        "organizationId": params.organizationId,
-        "locationId": params.locationId,
+        "startDate": startDate.isoformat(), "endDate": endDate.isoformat(),
+        "organizationId": organizationId, "locationId": locationId,
     }
 
     async with aiohttp.ClientSession(base_url=settings.api_base_url, timeout=aiohttp.ClientTimeout(total=settings.request_timeout)) as session:
@@ -202,33 +296,44 @@ async def query_schedules(jwt: Annotated[str, Field(description="User's JWT for 
                 raise ToolError(f"API Error ({response.status}): {error_detail}")
             result = await response.json()
 
-    logger.info(f"Found {len(result.get('data', []))} schedules in the specified range.")
-    return result
+    count = len(result.get('data', []))
+    await ctx.info(f"Found {count} schedules.")
+    return ScheduleListResponse(**result)
 
-# --- 7. Prompts ---
+# --- 7. Improved Prompts with Input Validation ---
 @mcp.prompt(description="Formats a confirmation for a newly created schedule.")
 def format_creation_confirmation(title: str, startTime: datetime, scheduleRecordId: str) -> str:
     friendly_time = startTime.strftime("%A, %B %d, %Y at %I:%M %p")
     return f"✅ Success! The schedule '{title}' has been created for {friendly_time}. The new Schedule ID is `{scheduleRecordId}`."
 
 @mcp.prompt(description="Summarizes a list of schedules into a readable format.")
-def summarize_schedule_list(schedule_data: Dict[str, List]) -> str:
-    schedules = schedule_data.get('data', [])
+def summarize_schedule_list(schedule_data: ScheduleListResponse) -> str:
+    schedules = schedule_data.data
     if not schedules:
         return "No schedules were found in the given timeframe."
     
     lines = [f"Found {len(schedules)} schedule(s):"]
-    schedules.sort(key=lambda s: s.get('startTime', ''))
+    schedules.sort(key=lambda s: s.startTime)
 
     for item in schedules:
-        start_time = datetime.fromisoformat(item['startTime'].replace('Z', '+00:00'))
-        friendly_time = start_time.strftime('%a, %b %d at %I:%M %p')
-        lines.append(f"- **{item['title']}** on {friendly_time} (ID: `{item.get('scheduleRecordId', 'N/A')}`)")
+        friendly_time = item.startTime.strftime('%a, %b %d at %I:%M %p')
+        lines.append(f"- **{item.title}** on {friendly_time} (ID: `{item.scheduleRecordId}`)")
         
     return "\n".join(lines)
 
 # --- 8. Server Execution ---
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))  # Use Render's dynamic port
-    logger.info(f"Starting Business Scheduling Assistant MCP at http://0.0.0.0:{port}")
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    # REASON FOR IMPROVEMENT:
+    # The development token now includes the specific scopes needed to pass our
+    # new, more granular authorization checks.
+    sample_token = key_pair.create_token(
+        subject="dev-user",
+        scopes=["api:access", "schedule:read", "schedule:write"]
+    )
+    logger.info("="*80)
+    logger.info("🚀 Starting Business Scheduling Assistant MCP")
+    logger.info(f"🔑 Development JWT (use with 'Bearer' scheme): {sample_token}")
+    logger.info("="*80)
+
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
